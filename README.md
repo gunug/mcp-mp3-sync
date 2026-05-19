@@ -22,6 +22,12 @@ pip install -r requirements.txt
 
 `ffmpeg` 는 별도 설치 불필요 — `imageio-ffmpeg` 가 번들된 바이너리를 사용한다.
 
+`pyrubberband` 는 wrapper 이므로 **`rubberband` CLI 바이너리** 가 PATH 에 있어야 한다 (Windows):
+
+```powershell
+scoop install rubberband   # https://breakfastquay.com/rubberband/ 공식 바이너리
+```
+
 ## CLI 사용법
 
 `mp3/` 디렉터리의 모든 mp3 를 처리해서 `output/` 에 저장.
@@ -39,8 +45,8 @@ python sync_bpm.py --bpm 128 --input-dir my_songs --output-dir result
 | 파일 | 설명 |
 | --- | --- |
 | `kick_{bpm}bpm.mp3` | 기준 BPM 의 kick 드럼 트랙 (10초) |
-| `{name}_synced_{bpm}bpm.mp3` | 싱크된 결과 (mono) |
-| `{name}_verify_{bpm}bpm.mp3` | L=kick, R=결과 인 스테레오 검증용 |
+| `{name}_synced_{bpm}bpm.mp3` | 싱크된 결과 (스테레오 유지, 320 kbps) |
+| `{name}_verify_{bpm}bpm.mp3` | L=kick, R=결과(mono 다운믹스) 인 스테레오 검증용 |
 
 ## MCP 서버로 사용
 
@@ -138,11 +144,12 @@ claude mcp remove mp3-bpm-sync
 
 ## 동작 원리 요약
 
-1. `librosa.beat.beat_track` 으로 전체 비트 시각 + raw BPM 검출
+1. `librosa.beat.beat_track` 으로 전체 비트 시각 + raw BPM 검출 (mono 다운믹스 사용)
 2. raw 가 목표 BPM 의 절반이면 비트 사이에 중간점 삽입, 두 배면 한 칸씩 솎아냄 (옥타브 보정)
 3. 첫 비트 위치를 0초로 잘라냄 (다운비트 정렬)
-4. 비트 구간마다 독립 `time_stretch` + 강제 `target_n` 샘플 정렬 → 그리드 완벽 정렬
-5. 결과 + L채널 kick 이 합쳐진 검증용 스테레오 mp3 동시 출력
+4. 비트 구간마다 **pyrubberband 로 독립 time-stretch** (스테레오 유지, 트랜지언트 보존)
+5. 인접 segment 끼리 **5 ms equal-power 크로스페이드** 로 OLA 결합 → 경계 클릭 제거
+6. 소프트 리미터 + 320 kbps MP3 인코딩, 검증용 스테레오 mp3 동시 출력
 
 자세한 코드: [sync_bpm.py](sync_bpm.py)
 

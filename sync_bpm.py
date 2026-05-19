@@ -12,6 +12,7 @@ from pathlib import Path
 import imageio_ffmpeg
 import librosa
 import numpy as np
+import pyrubberband as pyrb
 import soundfile as sf
 from pydub import AudioSegment
 
@@ -107,27 +108,37 @@ def detect_beats(
     return beats, snapped, raw_bpm, k
 
 
-def time_stretch(y: np.ndarray, rate: float) -> np.ndarray:
-    """피치 유지하며 템포 변경. rate > 1 → 빨라짐."""
+def time_stretch(y: np.ndarray, rate: float, sr: int = SR) -> np.ndarray:
+    """피치 유지하며 템포 변경. rate > 1 → 빨라짐. mono (n,) / stereo (n, c) 모두 OK.
+
+    pyrubberband 사용 — librosa phase vocoder 대비 트랜지언트 보존 우수.
+    """
     if abs(rate - 1.0) < 1e-4:
-        return y
-    return librosa.effects.time_stretch(y=y, rate=rate)
+        return y.astype(np.float32, copy=False)
+    return pyrb.time_stretch(y, sr, rate).astype(np.float32)
 
 
 def time_varying_stretch(
     y: np.ndarray, sr: int, beats_sec: np.ndarray, target_bpm: float
 ) -> np.ndarray:
-    """비트 간격마다 독립 스트레치 → 가변 BPM 보정.
+    """비트 간격마다 독립 스트레치 + 경계 OLA 크로스페이드.
 
-    출력 길이 = (N_segments) × target_interval 로 그리드에 완벽히 정렬.
+    각 segment 를 target_n + crossfade_n 으로 stretch 한 뒤 인접 segment 와
+    crossfade_n 만큼 오버랩 가산 → 그리드는 target_n 단위로 정렬되면서
+    경계 위상 점프(클릭) 가 사라짐.
     """
     target_interval = 60.0 / target_bpm
     target_n = int(round(target_interval * sr))
+    crossfade_n = max(8, int(round(0.005 * sr)))  # 5 ms equal-power crossfade
+    extended_n = target_n + crossfade_n
 
-    # 마지막 비트 뒤 꼬리도 한 박으로 매핑하기 위해 가상 종료 비트 추가
+    is_stereo = y.ndim == 2
+    channels = y.shape[1] if is_stereo else 1
+    n_total = y.shape[0]
+
     if len(beats_sec) >= 2:
         median_iv = float(np.median(np.diff(beats_sec)))
-        last_virtual = min(beats_sec[-1] + median_iv, len(y) / sr)
+        last_virtual = min(beats_sec[-1] + median_iv, n_total / sr)
         beats_ext = np.concatenate([beats_sec, [last_virtual]])
     else:
         beats_ext = beats_sec
@@ -136,42 +147,84 @@ def time_varying_stretch(
     for i in range(len(beats_ext) - 1):
         start = int(round(beats_ext[i] * sr))
         end = int(round(beats_ext[i + 1] * sr))
-        end = min(end, len(y))
+        end = min(end, n_total)
         if end <= start:
             continue
         seg = y[start:end]
         src_dur = (end - start) / sr
-        rate = src_dur / target_interval
+        # 목표: extended_n 샘플 (인접 segment 와 crossfade_n 오버랩)
+        rate = src_dur * sr / extended_n
 
-        # 너무 비정상적인 간격(검출 오류) → 스트레치 없이 길이만 맞춤
-        if rate < 0.5 or rate > 2.0 or len(seg) < 64:
-            seg_out = seg
+        if rate < 0.5 or rate > 2.0 or (end - start) < 64:
+            seg_out = seg.astype(np.float32, copy=False)
         else:
             try:
-                seg_out = librosa.effects.time_stretch(y=seg, rate=rate)
+                seg_out = pyrb.time_stretch(seg, sr, rate).astype(np.float32)
             except Exception:
-                seg_out = seg
+                seg_out = seg.astype(np.float32, copy=False)
 
-        # 강제로 target_n 샘플로 맞춤 → 그리드 정렬 보장
-        if len(seg_out) >= target_n:
-            seg_out = seg_out[:target_n]
+        # 정확히 extended_n 으로 맞춤
+        if seg_out.shape[0] >= extended_n:
+            seg_out = seg_out[:extended_n]
         else:
-            seg_out = np.pad(seg_out, (0, target_n - len(seg_out)))
+            pad_width = [(0, extended_n - seg_out.shape[0])]
+            if is_stereo:
+                pad_width.append((0, 0))
+            seg_out = np.pad(seg_out, pad_width)
         out_segments.append(seg_out)
 
     if not out_segments:
-        return y
-    return np.concatenate(out_segments).astype(np.float32)
+        return y.astype(np.float32, copy=False)
+
+    n_segs = len(out_segments)
+    total_len = n_segs * target_n + crossfade_n
+    if is_stereo:
+        result = np.zeros((total_len, channels), dtype=np.float32)
+    else:
+        result = np.zeros(total_len, dtype=np.float32)
+
+    fade_in = np.sin(np.linspace(0.0, np.pi / 2.0, crossfade_n)).astype(np.float32)
+    fade_out = np.cos(np.linspace(0.0, np.pi / 2.0, crossfade_n)).astype(np.float32)
+    if is_stereo:
+        fade_in_b = fade_in[:, None]
+        fade_out_b = fade_out[:, None]
+    else:
+        fade_in_b = fade_in
+        fade_out_b = fade_out
+
+    for i, seg in enumerate(out_segments):
+        s_pos = i * target_n
+        e_pos = s_pos + seg.shape[0]
+        s = seg.copy()
+        if i > 0:
+            s[:crossfade_n] *= fade_in_b
+        if i < n_segs - 1:
+            s[-crossfade_n:] *= fade_out_b
+        result[s_pos:e_pos] += s
+
+    return result
 
 
 def align_first_beat(y: np.ndarray, src_first_beat_sec: float, sr: int) -> np.ndarray:
-    """첫 비트가 0초가 되도록 앞을 잘라내거나(또는 무음 패딩)."""
+    """첫 비트가 0초가 되도록 앞을 잘라내거나(또는 무음 패딩). mono/stereo 모두 OK."""
     offset = int(round(src_first_beat_sec * sr))
     if offset > 0:
         return y[offset:]
     if offset < 0:
-        return np.concatenate([np.zeros(-offset, dtype=y.dtype), y])
+        if y.ndim == 2:
+            pad = np.zeros((-offset, y.shape[1]), dtype=y.dtype)
+        else:
+            pad = np.zeros(-offset, dtype=y.dtype)
+        return np.concatenate([pad, y])
     return y
+
+
+def soft_limit(y: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
+    """피크가 ceiling 초과 시 균등 스케일 다운. 하드 클립 회피."""
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak > ceiling:
+        return (y * (ceiling / peak)).astype(np.float32, copy=False)
+    return y.astype(np.float32, copy=False)
 
 
 def to_int16(y: np.ndarray) -> np.ndarray:
@@ -179,21 +232,22 @@ def to_int16(y: np.ndarray) -> np.ndarray:
     return (y * 32767).astype(np.int16)
 
 
-def write_mp3(path: Path, y: np.ndarray, sr: int, channels: int = 1) -> None:
-    """np.float32 (mono) 또는 (samples, 2) 스테레오 → mp3 저장."""
+def write_mp3(path: Path, y: np.ndarray, sr: int, channels: int | None = None) -> None:
+    """mono (n,) 또는 stereo (n, c) → soft-limit 후 320 kbps mp3 저장."""
+    y = soft_limit(np.ascontiguousarray(y, dtype=np.float32))
     if y.ndim == 1:
-        data = to_int16(y).tobytes()
+        ch = 1 if channels is None else channels
     else:
-        # interleave stereo
-        data = to_int16(y).tobytes()
-        channels = y.shape[1]
+        ch = y.shape[1]
+    # numpy (n, c) 의 tobytes() 는 row-major → [L0,R0,L1,R1,...] interleave 와 일치
+    data = to_int16(y).tobytes()
     seg = AudioSegment(
         data=data,
         sample_width=2,
         frame_rate=sr,
-        channels=channels,
+        channels=ch,
     )
-    seg.export(str(path), format="mp3", bitrate="192k")
+    seg.export(str(path), format="mp3", bitrate="320k")
 
 
 def detect_bpm_only(mp3_path: Path, target_bpm: float = 120.0) -> dict:
@@ -202,9 +256,10 @@ def detect_bpm_only(mp3_path: Path, target_bpm: float = 120.0) -> dict:
     MCP/라이브러리 호출용 조용한 API.
     """
     mp3_path = Path(mp3_path)
-    y, sr = librosa.load(str(mp3_path), sr=SR, mono=True)
-    duration = len(y) / sr
-    beats, avg_bpm, raw_bpm, k = detect_beats(y, sr, target_bpm)
+    y_raw, sr = librosa.load(str(mp3_path), sr=SR, mono=False)
+    y_mono = y_raw if y_raw.ndim == 1 else np.mean(y_raw, axis=0)
+    duration = len(y_mono) / sr
+    beats, avg_bpm, raw_bpm, k = detect_beats(y_mono, sr, target_bpm)
 
     result = {
         "input": str(mp3_path.resolve()),
@@ -239,14 +294,21 @@ def sync_mp3_file(mp3_path: Path, target_bpm: float, out_dir: Path) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    y, sr = librosa.load(str(mp3_path), sr=SR, mono=True)
-    duration = len(y) / sr
+    y_raw, sr = librosa.load(str(mp3_path), sr=SR, mono=False)
+    # 비트 검출은 mono 가 안정적, 실제 처리는 stereo 유지
+    if y_raw.ndim == 1:
+        y_mono = y_raw
+        y_work = y_raw  # (n,)
+    else:
+        y_mono = np.mean(y_raw, axis=0)
+        y_work = np.ascontiguousarray(y_raw.T)  # (n, channels)
+    duration = len(y_mono) / sr
 
-    beats, avg_bpm, raw_bpm, k = detect_beats(y, sr, target_bpm)
+    beats, avg_bpm, raw_bpm, k = detect_beats(y_mono, sr, target_bpm)
 
     if len(beats) < 2:
         rate = target_bpm / max(avg_bpm, 1.0)
-        y_synced = time_stretch(y, rate)
+        y_synced = time_stretch(y_work, rate, sr)
         first_beat = 0.0
         local_stats = {"local_bpm_min": None, "local_bpm_max": None, "local_bpm_std": None}
         method = "global_stretch_fallback"
@@ -258,21 +320,25 @@ def sync_mp3_file(mp3_path: Path, target_bpm: float, out_dir: Path) -> dict:
             "local_bpm_std": round(float(local_bpms.std()), 3),
         }
         first_beat = float(beats[0])
-        y_aligned = align_first_beat(y, first_beat, sr)
+        y_aligned = align_first_beat(y_work, first_beat, sr)
         beats_aligned = beats - first_beat
         y_synced = time_varying_stretch(y_aligned, sr, beats_aligned, target_bpm)
         method = "per_beat_variable_stretch"
 
-    synced_duration = len(y_synced) / sr
+    synced_duration = y_synced.shape[0] / sr
     stem = mp3_path.stem
     out_synced = out_dir / f"{stem}_synced_{int(target_bpm)}bpm.mp3"
     write_mp3(out_synced, y_synced, sr)
 
+    # verify: L = kick (mono), R = synced (stereo → mono mix)
+    synced_for_verify = (
+        np.mean(y_synced, axis=1) if y_synced.ndim == 2 else y_synced
+    )
     kick = generate_kick(target_bpm, synced_duration, sr)
-    n = min(len(kick), len(y_synced))
-    stereo = np.stack([kick[:n], y_synced[:n]], axis=1)
+    n = min(len(kick), len(synced_for_verify))
+    stereo = np.stack([kick[:n], synced_for_verify[:n]], axis=1)
     out_verify = out_dir / f"{stem}_verify_{int(target_bpm)}bpm.mp3"
-    write_mp3(out_verify, stereo, sr, channels=2)
+    write_mp3(out_verify, stereo, sr)
 
     return {
         "input": str(mp3_path.resolve()),

@@ -15,6 +15,7 @@ import numpy as np
 import pyrubberband as pyrb
 import soundfile as sf
 from pydub import AudioSegment
+from scipy import signal as _spsig
 
 # pydub 가 imageio-ffmpeg 의 ffmpeg 를 사용하도록 설정 (시스템 ffmpeg 불필요)
 _FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -219,6 +220,99 @@ def align_first_beat(y: np.ndarray, src_first_beat_sec: float, sr: int) -> np.nd
     return y
 
 
+def _highpass(y: np.ndarray, sr: int, cutoff: float = 100.0, order: int = 4) -> np.ndarray:
+    """Butterworth zero-phase HPF. y: (n,) or (n, channels) — axis 0 가 시간축."""
+    sos = _spsig.butter(order, cutoff, btype="highpass", fs=sr, output="sos")
+    return _spsig.sosfiltfilt(sos, y, axis=0).astype(np.float32)
+
+
+def _make_duck_gain(
+    n_samples: int,
+    sr: int,
+    target_bpm: float,
+    depth_db: float = -6.0,
+    attack_ms: float = 5.0,
+    hold_ms: float = 30.0,
+    release_ms: float = 120.0,
+) -> np.ndarray:
+    """그리드 박마다 -depth_db 만큼 잠시 죽이는 envelope.
+
+    synced 가 이미 target_bpm 그리드에 정렬되어 있으므로 kick 의 envelope follower
+    없이 비트 위치에 직접 ducking 커브를 깔면 끝.
+    """
+    gain = np.ones(n_samples, dtype=np.float32)
+    beat_interval = 60.0 / target_bpm
+    n_beats = int(np.floor(n_samples / sr / beat_interval)) + 2
+
+    floor = float(10.0 ** (depth_db / 20.0))  # 0 < floor < 1
+    attack_n = max(1, int(round(sr * attack_ms / 1000.0)))
+    hold_n = max(1, int(round(sr * hold_ms / 1000.0)))
+    release_n = max(1, int(round(sr * release_ms / 1000.0)))
+
+    attack_curve = np.linspace(1.0, floor, attack_n, dtype=np.float32)
+    release_curve = np.linspace(floor, 1.0, release_n, dtype=np.float32)
+
+    for i in range(n_beats):
+        beat_pos = int(round(i * beat_interval * sr))
+        if beat_pos >= n_samples:
+            break
+        s = beat_pos
+        e = min(s + attack_n, n_samples)
+        gain[s:e] = np.minimum(gain[s:e], attack_curve[: e - s])
+        s2, e2 = e, min(e + hold_n, n_samples)
+        if e2 > s2:
+            gain[s2:e2] = np.minimum(gain[s2:e2], floor)
+        s3, e3 = e2, min(e2 + release_n, n_samples)
+        if e3 > s3:
+            gain[s3:e3] = np.minimum(gain[s3:e3], release_curve[: e3 - s3])
+    return gain
+
+
+MIX_METHODS = ("hpf", "simple", "duck")
+
+
+def mix_kick_with_synced(
+    synced: np.ndarray,
+    kick: np.ndarray,
+    sr: int,
+    target_bpm: float,
+    method: str = "hpf",
+    kick_gain: float = 0.5,
+    hpf_cutoff: float = 100.0,
+    duck_depth_db: float = -6.0,
+) -> np.ndarray:
+    """synced(mono/stereo) + kick(mono) → 스테레오 믹스 (n, 2).
+
+    method:
+      'simple' — synced + kick*gain (단순 합)
+      'hpf'    — synced 에 ``hpf_cutoff`` Hz HPF → kick 의 저음 자리 확보 후 합
+      'duck'   — synced 에 박마다 ``duck_depth_db`` 사이드체인 ducking 후 합
+    """
+    if method not in MIX_METHODS:
+        raise ValueError(f"unknown mix method: {method!r}; choose from {MIX_METHODS}")
+
+    n = min(kick.shape[0], synced.shape[0])
+    kick = kick[:n].astype(np.float32, copy=False) * float(kick_gain)
+    s = synced[:n]
+
+    # synced 를 (n, 2) stereo 로 정규화
+    if s.ndim == 1:
+        s_st = np.stack([s, s], axis=1).astype(np.float32, copy=False)
+    elif s.shape[1] == 1:
+        s_st = np.repeat(s, 2, axis=1).astype(np.float32, copy=False)
+    else:
+        s_st = s.astype(np.float32, copy=False)
+
+    if method == "hpf":
+        s_st = _highpass(s_st, sr, cutoff=hpf_cutoff)
+    elif method == "duck":
+        duck = _make_duck_gain(n, sr, target_bpm, depth_db=duck_depth_db)
+        s_st = s_st * duck[:, None]
+
+    kick_st = np.stack([kick, kick], axis=1)
+    return (s_st + kick_st).astype(np.float32, copy=False)
+
+
 def soft_limit(y: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
     """피크가 ceiling 초과 시 균등 스케일 다운. 하드 클립 회피."""
     peak = float(np.max(np.abs(y))) if y.size else 0.0
@@ -285,8 +379,18 @@ def detect_bpm_only(mp3_path: Path, target_bpm: float = 120.0) -> dict:
     return result
 
 
-def sync_mp3_file(mp3_path: Path, target_bpm: float, out_dir: Path) -> dict:
-    """mp3 → target_bpm 싱크 + 검증용 스테레오 mp3 생성. 결과 dict 반환.
+def sync_mp3_file(
+    mp3_path: Path,
+    target_bpm: float,
+    out_dir: Path,
+    merge_method: str = "hpf",
+    merge_kick_gain: float = 0.5,
+) -> dict:
+    """mp3 → target_bpm 싱크 + 검증용 스테레오 mp3 + kick 머지 mp3 생성.
+
+    Args:
+        merge_method: 'hpf' | 'simple' | 'duck' — kick 과 synced 를 한 트랙에 합치는 방식.
+        merge_kick_gain: 머지 시 kick 의 상대 게인 (1.0 = 원본 kick).
 
     print 하지 않는 조용한 API (MCP/라이브러리 호출용).
     """
@@ -340,6 +444,18 @@ def sync_mp3_file(mp3_path: Path, target_bpm: float, out_dir: Path) -> dict:
     out_verify = out_dir / f"{stem}_verify_{int(target_bpm)}bpm.mp3"
     write_mp3(out_verify, stereo, sr)
 
+    # merged: kick + synced 를 한 트랙으로 합친 스테레오 mp3
+    merged = mix_kick_with_synced(
+        synced=y_synced,
+        kick=kick,
+        sr=sr,
+        target_bpm=target_bpm,
+        method=merge_method,
+        kick_gain=merge_kick_gain,
+    )
+    out_merged = out_dir / f"{stem}_merged_{merge_method}_{int(target_bpm)}bpm.mp3"
+    write_mp3(out_merged, merged, sr)
+
     return {
         "input": str(mp3_path.resolve()),
         "input_duration_sec": round(duration, 3),
@@ -355,8 +471,11 @@ def sync_mp3_file(mp3_path: Path, target_bpm: float, out_dir: Path) -> dict:
         **local_stats,
         "synced_duration_sec": round(synced_duration, 3),
         "method": method,
+        "merge_method": merge_method,
+        "merge_kick_gain": float(merge_kick_gain),
         "output_synced": str(out_synced.resolve()),
         "output_verify": str(out_verify.resolve()),
+        "output_merged": str(out_merged.resolve()),
     }
 
 
@@ -374,10 +493,16 @@ def generate_kick_file(target_bpm: float, duration_sec: float, out_dir: Path) ->
     }
 
 
-def process_one(mp3_path: Path, target_bpm: float, out_dir: Path) -> None:
+def process_one(
+    mp3_path: Path,
+    target_bpm: float,
+    out_dir: Path,
+    merge_method: str = "hpf",
+    merge_kick_gain: float = 0.5,
+) -> None:
     """CLI용 wrapper — sync_mp3_file 호출 후 결과를 print."""
     print(f"\n=== {mp3_path.name} ===")
-    r = sync_mp3_file(mp3_path, target_bpm, out_dir)
+    r = sync_mp3_file(mp3_path, target_bpm, out_dir, merge_method, merge_kick_gain)
     print(f"  로드: {r['input_duration_sec']:.2f}s @ {SR}Hz")
 
     if r["method"] == "global_stretch_fallback":
@@ -405,6 +530,10 @@ def process_one(mp3_path: Path, target_bpm: float, out_dir: Path) -> None:
     print(f"  싱크 후 길이: {r['synced_duration_sec']:.2f}s")
     print(f"  저장: {Path(r['output_synced']).name}")
     print(f"  저장: {Path(r['output_verify']).name} (L=kick, R=synced)")
+    print(
+        f"  저장: {Path(r['output_merged']).name}"
+        f" (mix={r['merge_method']}, kick_gain={r['merge_kick_gain']:g})"
+    )
 
 
 def main() -> int:
@@ -412,6 +541,18 @@ def main() -> int:
     ap.add_argument("--bpm", type=float, default=170.0)
     ap.add_argument("--input-dir", default="mp3")
     ap.add_argument("--output-dir", default="output")
+    ap.add_argument(
+        "--merge-method",
+        choices=MIX_METHODS,
+        default="hpf",
+        help="kick 과 synced 를 한 mp3 에 합치는 방식 (default: hpf)",
+    )
+    ap.add_argument(
+        "--merge-kick-gain",
+        type=float,
+        default=0.5,
+        help="머지 시 kick 상대 게인 (default: 0.5)",
+    )
     args = ap.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -430,7 +571,7 @@ def main() -> int:
         return 1
 
     for p in mp3_files:
-        process_one(p, args.bpm, out_dir)
+        process_one(p, args.bpm, out_dir, args.merge_method, args.merge_kick_gain)
 
     print(f"\n완료: {len(mp3_files)}개 처리됨 → {out_dir}/")
     return 0

@@ -47,6 +47,23 @@ python sync_bpm.py --bpm 128 --input-dir my_songs --output-dir result
 | `kick_{bpm}bpm.mp3` | 기준 BPM 의 kick 드럼 트랙 (10초) |
 | `{name}_synced_{bpm}bpm.mp3` | 싱크된 결과 (스테레오 유지, 320 kbps) |
 | `{name}_verify_{bpm}bpm.mp3` | L=kick, R=결과(mono 다운믹스) 인 스테레오 검증용 |
+| `{name}_merged_{method}_{bpm}bpm.mp3` | kick + synced 가 한 트랙에 믹스된 스테레오 결과 |
+
+### 머지 (kick + synced) 옵션
+
+`--merge-method` 로 kick 을 synced 위에 얹는 방식을 선택할 수 있다.
+
+| method | 동작 | 적합한 상황 |
+| --- | --- | --- |
+| `hpf` (기본) | synced 에 100 Hz 하이패스 → kick 의 저음 자리 확보 후 합 | 일반적 / 보컬·악기 위주 곡 |
+| `simple` | synced + kick × gain 단순 합 | 빠른 디버깅, 저음 충돌 신경 안 쓸 때 |
+| `duck` | 박마다 -6 dB 사이드체인 ducking (5/30/120 ms attack/hold/release) | EDM 펌핑 / 그루브 강조 |
+
+`--merge-kick-gain` (기본 0.5) 로 kick 의 상대 음량 조정. 1.0 = 원본 그대로.
+
+```powershell
+python sync_bpm.py --bpm 170 --merge-method duck --merge-kick-gain 0.6
+```
 
 ## MCP 서버로 사용
 
@@ -57,7 +74,7 @@ Claude Code, Claude Desktop 등에서 도구로 호출할 수 있다.
 
 | 도구 | 설명 |
 | --- | --- |
-| `sync_mp3_to_bpm(mp3_path, target_bpm, output_dir="output")` | mp3 를 목표 BPM 으로 싱크하고 검증 mp3 까지 생성 |
+| `sync_mp3_to_bpm(mp3_path, target_bpm, merge_method="hpf", merge_kick_gain=0.5)` | mp3 를 목표 BPM 으로 싱크 + 검증 mp3 + kick 머지 mp3 생성 |
 | `detect_bpm(mp3_path, target_bpm_prior=120.0)` | 파일 저장 없이 BPM/비트 정보만 반환 |
 | `generate_kick_track(target_bpm, duration_sec=10.0, output_dir="output")` | 기준 BPM kick 트랙 mp3 단독 생성 |
 

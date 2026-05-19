@@ -24,27 +24,41 @@ mcp = FastMCP("mp3-bpm-sync")
 def sync_mp3_to_bpm(
     mp3_path: str,
     target_bpm: float,
+    merge_method: str = "hpf",
+    merge_kick_gain: float = 0.5,
 ) -> dict:
-    """mp3 파일을 target_bpm 으로 싱크하고 검증용 스테레오 mp3 도 함께 생성.
+    """mp3 를 target_bpm 으로 싱크하고 검증용 + kick 머지 스테레오 mp3 를 함께 생성.
 
     Args:
         mp3_path: 입력 mp3 파일 경로. 상대경로면 MCP 서버 cwd
             (= Claude Code 가 실행된 디렉터리) 기준.
         target_bpm: 목표 BPM (예: 170.0).
+        merge_method: kick 과 synced 를 한 스테레오 mp3 로 합치는 방식.
+            - 'hpf' (기본): synced 에 100Hz 하이패스 후 합 — kick 저음 자리 확보
+            - 'simple'    : synced + kick*gain 단순 합
+            - 'duck'      : 박마다 -6 dB 사이드체인 ducking — EDM 펌핑
+        merge_kick_gain: 머지 시 kick 상대 게인 (기본 0.5, 원본=1.0).
 
-    출력은 `<cwd>/output/` 에 저장됨 (자동 생성).
+    출력은 `<cwd>/output/` 에 저장됨.
 
     Returns:
         입력 길이/원본 BPM/검출된 비트 수/싱크 후 길이/출력 파일 경로 등을 담은 dict.
-        - output_synced: target_bpm 으로 싱크된 mono mp3 절대 경로
-        - output_verify: L=기준 kick, R=싱크 결과 인 스테레오 mp3 절대 경로
+        - output_synced: target_bpm 으로 싱크된 스테레오 mp3 (320 kbps)
+        - output_verify: L=기준 kick, R=싱크 결과 인 검증용 스테레오 mp3
+        - output_merged: kick 과 synced 가 한 트랙에 믹스된 스테레오 mp3
     """
     p = Path(mp3_path)
     if not p.is_absolute():
         p = Path.cwd() / p
     if not p.is_file():
         raise FileNotFoundError(f"mp3 파일을 찾을 수 없습니다: {p}")
-    return sync_mp3_file(p, float(target_bpm), Path.cwd() / "output")
+    return sync_mp3_file(
+        p,
+        float(target_bpm),
+        Path.cwd() / "output",
+        merge_method=merge_method,
+        merge_kick_gain=float(merge_kick_gain),
+    )
 
 
 @mcp.tool()

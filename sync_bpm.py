@@ -429,23 +429,33 @@ def sync_mp3_file(
         y_synced = time_varying_stretch(y_aligned, sr, beats_aligned, target_bpm)
         method = "per_beat_variable_stretch"
 
-    synced_duration = y_synced.shape[0] / sr
+    synced_n = y_synced.shape[0]
+    synced_duration = synced_n / sr
     stem = mp3_path.stem
     out_synced = out_dir / f"{stem}_synced_{int(target_bpm)}bpm.mp3"
     write_mp3(out_synced, y_synced, sr)
 
-    # verify: L = kick (mono), R = synced (stereo → mono mix)
+    # 머지 트랙은 kick 4박 배수 경계까지 연장 — synced 가 끝난 뒤 kick 만 이어 깔린다.
+    beat_dur_sec = 60.0 / target_bpm
+    n_synced_beats = max(1, int(round(synced_n / (beat_dur_sec * sr))))
+    n_merged_beats = max(4, ((n_synced_beats + 3) // 4) * 4)
+    merged_total_sec = n_merged_beats * beat_dur_sec
+
+    # kick 은 연장 길이만큼 한 번에 생성해서 위상 연속성 확보
+    kick = generate_kick(target_bpm, merged_total_sec, sr)
+    kick_n = kick.shape[0]
+
+    # verify: L = kick (mono), R = synced (stereo → mono mix). 길이는 synced 기준.
     synced_for_verify = (
         np.mean(y_synced, axis=1) if y_synced.ndim == 2 else y_synced
     )
-    kick = generate_kick(target_bpm, synced_duration, sr)
-    n = min(len(kick), len(synced_for_verify))
-    stereo = np.stack([kick[:n], synced_for_verify[:n]], axis=1)
+    n_verify = min(kick_n, len(synced_for_verify))
+    stereo = np.stack([kick[:n_verify], synced_for_verify[:n_verify]], axis=1)
     out_verify = out_dir / f"{stem}_verify_{int(target_bpm)}bpm.mp3"
     write_mp3(out_verify, stereo, sr)
 
-    # merged: kick + synced 를 한 트랙으로 합친 스테레오 mp3
-    merged = mix_kick_with_synced(
+    # merged: kick + synced 믹스 후, synced 가 끝난 구간은 kick 만 이어 붙인다.
+    merged_main = mix_kick_with_synced(
         synced=y_synced,
         kick=kick,
         sr=sr,
@@ -453,6 +463,16 @@ def sync_mp3_file(
         method=merge_method,
         kick_gain=merge_kick_gain,
     )
+    n_mixed = merged_main.shape[0]
+    if kick_n > n_mixed:
+        tail = kick[n_mixed:] * float(merge_kick_gain)
+        tail_st = np.stack([tail, tail], axis=1).astype(np.float32)
+        merged = np.concatenate([merged_main, tail_st], axis=0).astype(np.float32)
+    else:
+        merged = merged_main
+    merged_duration_sec = merged.shape[0] / sr
+    tail_only_sec = max(0.0, merged_duration_sec - synced_duration)
+
     out_merged = out_dir / f"{stem}_merged_{merge_method}_{int(target_bpm)}bpm.mp3"
     write_mp3(out_merged, merged, sr)
 
@@ -473,6 +493,10 @@ def sync_mp3_file(
         "method": method,
         "merge_method": merge_method,
         "merge_kick_gain": float(merge_kick_gain),
+        "n_synced_beats": int(n_synced_beats),
+        "n_merged_beats": int(n_merged_beats),
+        "merged_duration_sec": round(merged_duration_sec, 3),
+        "tail_kick_only_sec": round(tail_only_sec, 3),
         "output_synced": str(out_synced.resolve()),
         "output_verify": str(out_verify.resolve()),
         "output_merged": str(out_merged.resolve()),
@@ -528,6 +552,11 @@ def process_one(
         print(f"  첫 비트: {r['first_beat_sec']:.3f}s | 가변 스트레치 적용")
 
     print(f"  싱크 후 길이: {r['synced_duration_sec']:.2f}s")
+    print(
+        f"  머지 길이: {r['merged_duration_sec']:.2f}s"
+        f" ({r['n_synced_beats']}박 → 4배수 경계 {r['n_merged_beats']}박,"
+        f" kick-only tail {r['tail_kick_only_sec']:.2f}s)"
+    )
     print(f"  저장: {Path(r['output_synced']).name}")
     print(f"  저장: {Path(r['output_verify']).name} (L=kick, R=synced)")
     print(

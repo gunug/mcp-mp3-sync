@@ -41,11 +41,18 @@ def sync_mp3_to_bpm(
 
     출력은 `<cwd>/output/` 에 저장됨.
 
+    output_merged 는 항상 kick 4박 배수(4, 8, 12, 16…) 경계에서 끝나도록
+    길이가 자동 연장됨 — 원본 mp3 가 경계 전에 끝나면 그 뒤는 kick 만
+    이어 깔린다 (기본 동작, 비활성화 옵션 없음).
+
     Returns:
         입력 길이/원본 BPM/검출된 비트 수/싱크 후 길이/출력 파일 경로 등을 담은 dict.
         - output_synced: target_bpm 으로 싱크된 스테레오 mp3 (320 kbps)
         - output_verify: L=기준 kick, R=싱크 결과 인 검증용 스테레오 mp3
         - output_merged: kick 과 synced 가 한 트랙에 믹스된 스테레오 mp3
+          (kick 4박 배수 경계까지 연장)
+        - n_synced_beats / n_merged_beats: 연장 전/후 박자 수
+        - tail_kick_only_sec: synced 종료 후 kick 만 깔린 구간 길이
     """
     p = Path(mp3_path)
     if not p.is_absolute():

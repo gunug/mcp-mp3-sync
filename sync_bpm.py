@@ -82,6 +82,22 @@ def snap_octave(bpm: float, target: float, max_k: int = 3) -> tuple[float, int]:
     return bpm * (2 ** k), k
 
 
+def compute_beat_reliability(beats: np.ndarray, threshold: float = 0.3) -> np.ndarray:
+    """각 beat 구간의 신뢰도 플래그 (True=신뢰, False=오검출 의심).
+
+    beat 간격의 중앙값 대비 편차가 threshold 초과하면 False.
+    반환 길이: len(beats) - 1
+    """
+    if len(beats) < 2:
+        return np.array([], dtype=bool)
+    intervals = np.diff(beats)
+    median_iv = float(np.median(intervals))
+    if median_iv <= 0:
+        return np.ones(len(intervals), dtype=bool)
+    deviations = np.abs(intervals - median_iv) / median_iv
+    return deviations <= threshold
+
+
 def detect_beats(
     y: np.ndarray, sr: int, target_bpm: float
 ) -> tuple[np.ndarray, float, float, int]:
@@ -120,13 +136,19 @@ def time_stretch(y: np.ndarray, rate: float, sr: int = SR) -> np.ndarray:
 
 
 def time_varying_stretch(
-    y: np.ndarray, sr: int, beats_sec: np.ndarray, target_bpm: float
-) -> np.ndarray:
+    y: np.ndarray, sr: int, beats_sec: np.ndarray, target_bpm: float,
+    reliable_flags: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """비트 간격마다 독립 스트레치 + 경계 OLA 크로스페이드.
 
     각 segment 를 target_n + crossfade_n 으로 stretch 한 뒤 인접 segment 와
     crossfade_n 만큼 오버랩 가산 → 그리드는 target_n 단위로 정렬되면서
     경계 위상 점프(클릭) 가 사라짐.
+
+    reliable_flags: 각 beat 구간 신뢰도 (True=신뢰). None 이면 전부 신뢰.
+    신뢰도 낮은 구간은 개별 rate 대신 median 기반 global rate 로 스트레치.
+
+    Returns (output_audio, output_reliable_flags).
     """
     target_interval = 60.0 / target_bpm
     target_n = int(round(target_interval * sr))
@@ -141,10 +163,14 @@ def time_varying_stretch(
         median_iv = float(np.median(np.diff(beats_sec)))
         last_virtual = min(beats_sec[-1] + median_iv, n_total / sr)
         beats_ext = np.concatenate([beats_sec, [last_virtual]])
+        global_rate = median_iv * sr / extended_n
     else:
         beats_ext = beats_sec
+        median_iv = target_interval
+        global_rate = 1.0
 
     out_segments: list[np.ndarray] = []
+    out_reliable: list[bool] = []
     for i in range(len(beats_ext) - 1):
         start = int(round(beats_ext[i] * sr))
         end = int(round(beats_ext[i + 1] * sr))
@@ -153,8 +179,13 @@ def time_varying_stretch(
             continue
         seg = y[start:end]
         src_dur = (end - start) / sr
-        # 목표: extended_n 샘플 (인접 segment 와 crossfade_n 오버랩)
-        rate = src_dur * sr / extended_n
+
+        is_reliable = True
+        if reliable_flags is not None and i < len(reliable_flags):
+            is_reliable = bool(reliable_flags[i])
+
+        # 신뢰도 낮은 구간은 global rate (중앙값 BPM 기준) 사용
+        rate = (global_rate if not is_reliable else src_dur * sr / extended_n)
 
         if rate < 0.5 or rate > 2.0 or (end - start) < 64:
             seg_out = seg.astype(np.float32, copy=False)
@@ -173,9 +204,11 @@ def time_varying_stretch(
                 pad_width.append((0, 0))
             seg_out = np.pad(seg_out, pad_width)
         out_segments.append(seg_out)
+        out_reliable.append(is_reliable)
 
     if not out_segments:
-        return y.astype(np.float32, copy=False)
+        empty = y.astype(np.float32, copy=False)
+        return empty, np.array([], dtype=bool)
 
     n_segs = len(out_segments)
     total_len = n_segs * target_n + crossfade_n
@@ -203,7 +236,60 @@ def time_varying_stretch(
             s[-crossfade_n:] *= fade_out_b
         result[s_pos:e_pos] += s
 
-    return result
+    return result, np.array(out_reliable, dtype=bool)
+
+
+def make_synced_envelope(
+    n_samples: int,
+    sr: int,
+    target_bpm: float,
+    reliable_flags: np.ndarray,
+    fade_beats: int = 2,
+    low_gain: float = 0.6,
+    start_fade_sec: float = 3.0,
+    end_fade_sec: float = 3.0,
+) -> np.ndarray:
+    """synced 트랙에 적용할 per-sample gain envelope (kick 제외).
+
+    - 신뢰도 낮은 beat 구간: low_gain, 전환 시 fade_beats 박 선형 페이드
+    - 곡 시작 start_fade_sec 초: 0→1 fade in
+    - 곡 끝 end_fade_sec 초: 1→0 fade out
+    - 두 envelope 겹칠 때: 더 낮은 값 적용 (minimum)
+    """
+    target_n = int(round(60.0 / target_bpm * sr))
+    fade_n = fade_beats * target_n
+    n_segs = len(reliable_flags)
+
+    # 신뢰도 기반 envelope
+    rel_env = np.ones(n_samples, dtype=np.float32)
+    for i, r in enumerate(reliable_flags):
+        s = i * target_n
+        e = min(s + target_n, n_samples)
+        if not r:
+            rel_env[s:e] = low_gain
+
+    # 신뢰도 전환 경계 페이드 (경계 중심으로 fade_n 샘플 선형 보간)
+    for i in range(n_segs - 1):
+        g_cur = 1.0 if reliable_flags[i] else low_gain
+        g_next = 1.0 if reliable_flags[i + 1] else low_gain
+        if abs(g_cur - g_next) < 1e-6:
+            continue
+        boundary = (i + 1) * target_n
+        fs = max(0, boundary - fade_n // 2)
+        fe = min(n_samples, boundary + fade_n // 2)
+        rel_env[fs:fe] = np.linspace(g_cur, g_next, fe - fs, dtype=np.float32)
+
+    # 시작/끝 fade envelope
+    se_env = np.ones(n_samples, dtype=np.float32)
+    fi_n = min(int(round(start_fade_sec * sr)), n_samples)
+    if fi_n > 0:
+        se_env[:fi_n] = np.linspace(0.0, 1.0, fi_n, dtype=np.float32)
+    fo_n = min(int(round(end_fade_sec * sr)), n_samples)
+    if fo_n > 0:
+        fade_out = np.linspace(1.0, 0.0, fo_n, dtype=np.float32)
+        se_env[n_samples - fo_n:] = np.minimum(se_env[n_samples - fo_n:], fade_out)
+
+    return np.minimum(rel_env, se_env)
 
 
 def align_first_beat(y: np.ndarray, src_first_beat_sec: float, sr: int) -> np.ndarray:
@@ -371,10 +457,17 @@ def detect_bpm_only(mp3_path: Path, target_bpm: float = 120.0) -> dict:
     }
     if len(beats) >= 2:
         local_bpms = 60.0 / np.diff(beats)
+        reliable_flags = compute_beat_reliability(beats)
+        n_reliable = int(np.sum(reliable_flags))
+        n_unreliable = len(reliable_flags) - n_reliable
         result.update(
             local_bpm_min=round(float(local_bpms.min()), 2),
             local_bpm_max=round(float(local_bpms.max()), 2),
             local_bpm_std=round(float(local_bpms.std()), 3),
+            median_beat_bpm=round(60.0 / float(np.median(np.diff(beats))), 2),
+            n_reliable_beats=n_reliable,
+            n_unreliable_beats=n_unreliable,
+            unreliable_ratio=round(n_unreliable / max(len(reliable_flags), 1), 3),
         )
     return result
 
@@ -415,6 +508,8 @@ def sync_mp3_file(
         y_synced = time_stretch(y_work, rate, sr)
         first_beat = 0.0
         local_stats = {"local_bpm_min": None, "local_bpm_max": None, "local_bpm_std": None}
+        reliable_stats = {"n_reliable_beats": 0, "n_unreliable_beats": 0, "unreliable_ratio": 1.0}
+        output_reliable = np.array([], dtype=bool)
         method = "global_stretch_fallback"
     else:
         local_bpms = 60.0 / np.diff(beats)
@@ -426,8 +521,36 @@ def sync_mp3_file(
         first_beat = float(beats[0])
         y_aligned = align_first_beat(y_work, first_beat, sr)
         beats_aligned = beats - first_beat
-        y_synced = time_varying_stretch(y_aligned, sr, beats_aligned, target_bpm)
+        reliable_flags = compute_beat_reliability(beats_aligned)
+        y_synced, output_reliable = time_varying_stretch(
+            y_aligned, sr, beats_aligned, target_bpm, reliable_flags
+        )
+        n_reliable = int(np.sum(output_reliable))
+        n_unreliable = len(output_reliable) - n_reliable
+        reliable_stats = {
+            "n_reliable_beats": n_reliable,
+            "n_unreliable_beats": n_unreliable,
+            "unreliable_ratio": round(n_unreliable / max(len(output_reliable), 1), 3),
+        }
         method = "per_beat_variable_stretch"
+
+    # synced 에 gain envelope 적용 (kick 제외)
+    if len(output_reliable) > 0:
+        envelope = make_synced_envelope(y_synced.shape[0], sr, target_bpm, output_reliable)
+        if y_synced.ndim == 2:
+            y_synced = (y_synced * envelope[:, None]).astype(np.float32)
+        else:
+            y_synced = (y_synced * envelope).astype(np.float32)
+    else:
+        # fallback: 시작/끝 fade 만 적용
+        envelope = make_synced_envelope(
+            y_synced.shape[0], sr, target_bpm,
+            np.ones(max(1, y_synced.shape[0] // int(round(60.0 / target_bpm * sr))), dtype=bool),
+        )
+        if y_synced.ndim == 2:
+            y_synced = (y_synced * envelope[:, None]).astype(np.float32)
+        else:
+            y_synced = (y_synced * envelope).astype(np.float32)
 
     synced_n = y_synced.shape[0]
     synced_duration = synced_n / sr
@@ -489,6 +612,7 @@ def sync_mp3_file(
         "n_beats": int(len(beats)),
         "first_beat_sec": round(first_beat, 3),
         **local_stats,
+        **reliable_stats,
         "synced_duration_sec": round(synced_duration, 3),
         "method": method,
         "merge_method": merge_method,

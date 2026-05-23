@@ -82,7 +82,7 @@ def snap_octave(bpm: float, target: float, max_k: int = 3) -> tuple[float, int]:
     return bpm * (2 ** k), k
 
 
-def compute_beat_reliability(beats: np.ndarray, threshold: float = 0.3) -> np.ndarray:
+def compute_beat_reliability(beats: np.ndarray, threshold: float = 0.15) -> np.ndarray:
     """각 beat 구간의 신뢰도 플래그 (True=신뢰, False=오검출 의심).
 
     beat 간격의 중앙값 대비 편차가 threshold 초과하면 False.
